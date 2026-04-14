@@ -7,21 +7,25 @@
 # integration files after adding or modifying agents.
 #
 # Usage:
-#   ./scripts/convert.sh [--tool <name>] [--out <dir>] [--help]
+#   ./scripts/convert.sh [--tool <name>] [--out <dir>] [--parallel] [--jobs N] [--help]
 #
 # Tools:
 #   antigravity  — Antigravity skill files (~/.gemini/antigravity/skills/)
 #   gemini-cli   — Gemini CLI extension (skills/ + gemini-extension.json)
-#   opencode     — OpenCode agent files (.opencode/agent/*.md)
+#   opencode     — OpenCode agent files (.opencode/agents/*.md)
 #   cursor       — Cursor rule files (.cursor/rules/*.mdc)
 #   aider        — Single CONVENTIONS.md for Aider
 #   windsurf     — Single .windsurfrules for Windsurf
-#   openclaw     — OpenClaw SOUL.md files (openclaw_workspace/<agent>/SOUL.md)
+#   openclaw     — OpenClaw workspaces (integrations/openclaw/<agent>/SOUL.md)
 #   qwen         — Qwen Code SubAgent files (~/.qwen/agents/*.md)
+#   kimi         — Kimi Code CLI agent files (~/.config/kimi/agents/)
 #   all          — All tools (default)
 #
 # Output is written to integrations/<tool>/ relative to the repo root.
 # This script never touches user config dirs — see install.sh for that.
+#
+#   --parallel       When tool is 'all', run independent tools in parallel (output order may vary).
+#   --jobs N         Max parallel jobs when using --parallel (default: nproc or 4).
 
 set -euo pipefail
 
@@ -37,6 +41,20 @@ warn()    { printf "${YELLOW}[!!]${RESET}  %s\n" "$*"; }
 error()   { printf "${RED}[ERR]${RESET} %s\n" "$*" >&2; }
 header()  { echo -e "\n${BOLD}$*${RESET}"; }
 
+# Progress bar: [=======>    ] 3/8 (tqdm-style)
+progress_bar() {
+  local current="$1" total="$2" width="${3:-20}" i filled empty
+  (( total > 0 )) || return
+  filled=$(( width * current / total ))
+  empty=$(( width - filled ))
+  printf "\r  ["
+  for (( i=0; i<filled; i++ )); do printf "="; done
+  if (( filled < width )); then printf ">"; (( empty-- )); fi
+  for (( i=0; i<empty; i++ )); do printf " "; done
+  printf "] %s/%s" "$current" "$total"
+  [[ -t 1 ]] || printf "\n"
+}
+
 # --- Paths ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,14 +62,22 @@ OUT_DIR="$REPO_ROOT/integrations"
 TODAY="$(date +%Y-%m-%d)"
 
 AGENT_DIRS=(
-  design engineering game-development marketing paid-media sales product project-management
-  testing support spatial-computing specialized
+  academic design engineering finance game-development marketing paid-media product project-management
+  sales spatial-computing specialized strategy support testing
 )
 
 # --- Usage ---
 usage() {
-  sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
+}
+
+# Default parallel job count (nproc on Linux; sysctl on macOS when nproc missing)
+parallel_jobs_default() {
+  local n
+  n=$(nproc 2>/dev/null) && [[ -n "$n" ]] && echo "$n" && return
+  n=$(sysctl -n hw.ncpu 2>/dev/null) && [[ -n "$n" ]] && echo "$n" && return
+  echo 4
 }
 
 # --- Frontmatter helpers ---
@@ -238,8 +264,8 @@ convert_openclaw() {
   # Split body sections into SOUL.md (persona) vs AGENTS.md (operations)
   # by matching ## header keywords. Unmatched sections go to AGENTS.md.
   #
-  # SOUL keywords: identity, memory (paired with identity), communication,
-  #   style, critical rules, rules you must follow
+  # SOUL keywords: identity, learning & memory, communication, style,
+  #   critical rules, rules you must follow
   # AGENTS keywords: everything else (mission, deliverables, workflow, etc.)
 
   local current_target="agents"  # default bucket
@@ -263,6 +289,7 @@ convert_openclaw() {
       header_lower="$(echo "$line" | tr '[:upper:]' '[:lower:]')"
 
       if [[ "$header_lower" =~ identity ]] ||
+         [[ "$header_lower" =~ learning.*memory ]] ||
          [[ "$header_lower" =~ communication ]] ||
          [[ "$header_lower" =~ style ]] ||
          [[ "$header_lower" =~ critical.rule ]] ||
@@ -346,6 +373,39 @@ description: ${description}
 ${body}
 HEREDOC
   fi
+}
+
+convert_kimi() {
+  local file="$1"
+  local name description slug outdir agent_file body
+
+  name="$(get_field "name" "$file")"
+  description="$(get_field "description" "$file")"
+  slug="$(slugify "$name")"
+  body="$(get_body "$file")"
+
+  outdir="$OUT_DIR/kimi/$slug"
+  agent_file="$outdir/agent.yaml"
+  mkdir -p "$outdir"
+
+  # Kimi Code CLI agent format: YAML with separate system prompt file
+  # Uses extend: default to inherit Kimi's default toolset
+  cat > "$agent_file" <<HEREDOC
+version: 1
+agent:
+  name: ${slug}
+  extend: default
+  system_prompt_path: ./system.md
+HEREDOC
+
+  # Write system prompt to separate file
+  cat > "$outdir/system.md" <<HEREDOC
+# ${name}
+
+${description}
+
+${body}
+HEREDOC
 }
 
 # Aider and Windsurf are single-file formats — accumulate into temp files
@@ -445,6 +505,7 @@ run_conversions() {
         cursor)      convert_cursor      "$file" ;;
         openclaw)    convert_openclaw    "$file" ;;
         qwen)        convert_qwen        "$file" ;;
+        kimi)        convert_kimi        "$file" ;;
         aider)       accumulate_aider    "$file" ;;
         windsurf)    accumulate_windsurf "$file" ;;
       esac
@@ -460,17 +521,22 @@ run_conversions() {
 
 main() {
   local tool="all"
+  local use_parallel=false
+  local parallel_jobs
+  parallel_jobs="$(parallel_jobs_default)"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --tool) tool="${2:?'--tool requires a value'}"; shift 2 ;;
-      --out)  OUT_DIR="${2:?'--out requires a value'}"; shift 2 ;;
-      --help|-h) usage ;;
-      *) error "Unknown option: $1"; usage ;;
+      --tool)     tool="${2:?'--tool requires a value'}"; shift 2 ;;
+      --out)      OUT_DIR="${2:?'--out requires a value'}"; shift 2 ;;
+      --parallel) use_parallel=true; shift ;;
+      --jobs)     parallel_jobs="${2:?'--jobs requires a value'}"; shift 2 ;;
+      --help|-h)  usage ;;
+      *)          error "Unknown option: $1"; usage ;;
     esac
   done
 
-  local valid_tools=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "all")
+  local valid_tools=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "kimi" "all")
   local valid=false
   for t in "${valid_tools[@]}"; do [[ "$t" == "$tool" ]] && valid=true && break; done
   if ! $valid; then
@@ -483,35 +549,72 @@ main() {
   echo "  Output: $OUT_DIR"
   echo "  Tool:   $tool"
   echo "  Date:   $TODAY"
+  if $use_parallel && [[ "$tool" == "all" ]]; then
+    info "Parallel mode: output buffered so each tool's output stays together."
+  fi
 
   local tools_to_run=()
   if [[ "$tool" == "all" ]]; then
-    tools_to_run=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen")
+    tools_to_run=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "kimi")
   else
     tools_to_run=("$tool")
   fi
 
   local total=0
-  for t in "${tools_to_run[@]}"; do
-    header "Converting: $t"
-    local count
-    count="$(run_conversions "$t")"
-    total=$(( total + count ))
 
-    # Gemini CLI also needs the extension manifest
-    if [[ "$t" == "gemini-cli" ]]; then
-      mkdir -p "$OUT_DIR/gemini-cli"
-      cat > "$OUT_DIR/gemini-cli/gemini-extension.json" <<'HEREDOC'
+  local n_tools=${#tools_to_run[@]}
+
+  if $use_parallel && [[ "$tool" == "all" ]]; then
+    # Tools that write to separate dirs can run in parallel; buffer output so each tool's output stays together
+    local parallel_tools=(antigravity gemini-cli opencode cursor openclaw qwen)
+    local parallel_out_dir
+    parallel_out_dir="$(mktemp -d)"
+    info "Converting: ${#parallel_tools[@]}/${n_tools} tools in parallel (output buffered per tool)..."
+    export AGENCY_CONVERT_OUT_DIR="$parallel_out_dir"
+    export AGENCY_CONVERT_SCRIPT="$SCRIPT_DIR/convert.sh"
+    export AGENCY_CONVERT_OUT="$OUT_DIR"
+    printf '%s\n' "${parallel_tools[@]}" | xargs -P "$parallel_jobs" -I {} sh -c '"$AGENCY_CONVERT_SCRIPT" --tool "{}" --out "$AGENCY_CONVERT_OUT" > "$AGENCY_CONVERT_OUT_DIR/{}" 2>&1'
+    for t in "${parallel_tools[@]}"; do
+      [[ -f "$parallel_out_dir/$t" ]] && cat "$parallel_out_dir/$t"
+    done
+    rm -rf "$parallel_out_dir"
+    local idx=7
+    for t in aider windsurf; do
+      progress_bar "$idx" "$n_tools"
+      printf "\n"
+      header "Converting: $t ($idx/$n_tools)"
+      local count
+      count="$(run_conversions "$t")"
+      total=$(( total + count ))
+      info "Converted $count agents for $t"
+      (( idx++ )) || true
+    done
+  else
+    local i=0
+    for t in "${tools_to_run[@]}"; do
+      (( i++ )) || true
+      progress_bar "$i" "$n_tools"
+      printf "\n"
+      header "Converting: $t ($i/$n_tools)"
+      local count
+      count="$(run_conversions "$t")"
+      total=$(( total + count ))
+
+      # Gemini CLI also needs the extension manifest (written by this process when --tool gemini-cli)
+      if [[ "$t" == "gemini-cli" ]]; then
+        mkdir -p "$OUT_DIR/gemini-cli"
+        cat > "$OUT_DIR/gemini-cli/gemini-extension.json" <<'HEREDOC'
 {
   "name": "agency-agents",
   "version": "1.0.0"
 }
 HEREDOC
-      info "Wrote gemini-extension.json"
-    fi
+        info "Wrote gemini-extension.json"
+      fi
 
-    info "Converted $count agents for $t"
-  done
+      info "Converted $count agents for $t"
+    done
+  fi
 
   # Write single-file outputs after accumulation
   if [[ "$tool" == "all" || "$tool" == "aider" ]]; then
@@ -526,7 +629,11 @@ HEREDOC
   fi
 
   echo ""
-  info "Done. Total conversions: $total"
+  if $use_parallel && [[ "$tool" == "all" ]]; then
+    info "Done. $n_tools tools (parallel; total conversions not aggregated)."
+  else
+    info "Done. Total conversions: $total"
+  fi
 }
 
 main "$@"

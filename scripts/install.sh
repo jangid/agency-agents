@@ -7,14 +7,14 @@
 # is missing or stale.
 #
 # Usage:
-#   ./scripts/install.sh [--tool <name>] [--interactive] [--no-interactive] [--help]
+#   ./scripts/install.sh [--tool <name>] [--interactive] [--no-interactive] [--parallel] [--jobs N] [--help]
 #
 # Tools:
 #   claude-code  -- Copy agents to ~/.claude/agents/
 #   copilot      -- Copy agents to ~/.github/agents/ and ~/.copilot/agents/
 #   antigravity  -- Copy skills to ~/.gemini/antigravity/skills/
 #   gemini-cli   -- Install extension to ~/.gemini/extensions/agency-agents/
-#   opencode     -- Copy agents to .opencode/agent/ in current directory
+#   opencode     -- Copy agents to .opencode/agents/ in current directory
 #   cursor       -- Copy rules to .cursor/rules/ in current directory
 #   aider        -- Copy CONVENTIONS.md to current directory
 #   windsurf     -- Copy .windsurfrules to current directory
@@ -26,6 +26,8 @@
 #   --tool <name>     Install only the specified tool
 #   --interactive     Show interactive selector (default when run in a terminal)
 #   --no-interactive  Skip interactive selector, install all detected tools
+#   --parallel        Run install for each selected tool in parallel (output order may vary)
+#   --jobs N          Max parallel jobs when using --parallel (default: nproc or 4)
 #   --help            Show this help
 #
 # Platform support:
@@ -53,6 +55,20 @@ warn()   { printf "${C_YELLOW}[!!]${C_RESET}  %s\n" "$*"; }
 err()    { printf "${C_RED}[ERR]${C_RESET} %s\n" "$*" >&2; }
 header() { printf "\n${C_BOLD}%s${C_RESET}\n" "$*"; }
 dim()    { printf "${C_DIM}%s${C_RESET}\n" "$*"; }
+
+# Progress bar: [=======>    ] 3/8 (tqdm-style)
+progress_bar() {
+  local current="$1" total="$2" width="${3:-20}" i filled empty
+  (( total > 0 )) || return
+  filled=$(( width * current / total ))
+  empty=$(( width - filled ))
+  printf "\r  ["
+  for (( i=0; i<filled; i++ )); do printf "="; done
+  if (( filled < width )); then printf ">"; (( empty-- )); fi
+  for (( i=0; i<empty; i++ )); do printf " "; done
+  printf "] %s/%s" "$current" "$total"
+  [[ -t 1 ]] || printf "\n"
+}
 
 # ---------------------------------------------------------------------------
 # Box drawing -- pure ASCII, fixed 52-char wide
@@ -85,14 +101,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INTEGRATIONS="$REPO_ROOT/integrations"
 
-ALL_TOOLS=(claude-code copilot antigravity gemini-cli opencode openclaw cursor aider windsurf qwen)
+ALL_TOOLS=(claude-code copilot antigravity gemini-cli opencode openclaw cursor aider windsurf qwen kimi)
+
+# Standard agent category directories (keep sorted, sync with convert.sh / lint-agents.sh)
+AGENT_DIRS=(
+  academic design engineering finance game-development marketing paid-media product project-management
+  sales spatial-computing specialized strategy support testing
+)
 
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
-  sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
+}
+
+# Default parallel job count (nproc on Linux; sysctl on macOS when nproc missing)
+parallel_jobs_default() {
+  local n
+  n=$(nproc 2>/dev/null) && [[ -n "$n" ]] && echo "$n" && return
+  n=$(sysctl -n hw.ncpu 2>/dev/null) && [[ -n "$n" ]] && echo "$n" && return
+  echo 4
 }
 
 # ---------------------------------------------------------------------------
@@ -118,6 +148,7 @@ detect_aider()        { command -v aider >/dev/null 2>&1; }
 detect_openclaw()     { command -v openclaw >/dev/null 2>&1 || [[ -d "${HOME}/.openclaw" ]]; }
 detect_windsurf()     { command -v windsurf >/dev/null 2>&1 || [[ -d "${HOME}/.codeium" ]]; }
 detect_qwen()         { command -v qwen >/dev/null 2>&1 || [[ -d "${HOME}/.qwen" ]]; }
+detect_kimi()         { command -v kimi >/dev/null 2>&1; }
 
 is_detected() {
   case "$1" in
@@ -131,6 +162,7 @@ is_detected() {
     aider)       detect_aider       ;;
     windsurf)    detect_windsurf    ;;
     qwen)        detect_qwen        ;;
+    kimi)        detect_kimi        ;;
     *)           return 1 ;;
   esac
 }
@@ -143,11 +175,12 @@ tool_label() {
     antigravity) printf "%-14s  %s" "Antigravity"  "(~/.gemini/antigravity)" ;;
     gemini-cli)  printf "%-14s  %s" "Gemini CLI"   "(gemini extension)"      ;;
     opencode)    printf "%-14s  %s" "OpenCode"     "(opencode.ai)"           ;;
-    openclaw)    printf "%-14s  %s" "OpenClaw"     "(~/.openclaw)"           ;;
+    openclaw)    printf "%-14s  %s" "OpenClaw"     "(~/.openclaw/agency-agents)" ;;
     cursor)      printf "%-14s  %s" "Cursor"       "(.cursor/rules)"         ;;
     aider)       printf "%-14s  %s" "Aider"        "(CONVENTIONS.md)"        ;;
     windsurf)    printf "%-14s  %s" "Windsurf"     "(.windsurfrules)"        ;;
     qwen)        printf "%-14s  %s" "Qwen Code"    "(~/.qwen/agents)"        ;;
+    kimi)        printf "%-14s  %s" "Kimi Code"    "(~/.config/kimi/agents)" ;;
   esac
 }
 
@@ -274,8 +307,7 @@ install_claude_code() {
   local count=0
   mkdir -p "$dest"
   local dir f first_line
-  for dir in design engineering game-development marketing paid-media sales product project-management \
-              testing support spatial-computing specialized; do
+  for dir in "${AGENT_DIRS[@]}"; do
     [[ -d "$REPO_ROOT/$dir" ]] || continue
     while IFS= read -r -d '' f; do
       first_line="$(head -1 "$f")"
@@ -293,8 +325,7 @@ install_copilot() {
   local count=0
   mkdir -p "$dest_github" "$dest_copilot"
   local dir f first_line
-  for dir in design engineering game-development marketing paid-media sales product project-management \
-              testing support spatial-computing specialized; do
+  for dir in "${AGENT_DIRS[@]}"; do
     [[ -d "$REPO_ROOT/$dir" ]] || continue
     while IFS= read -r -d '' f; do
       first_line="$(head -1 "$f")"
@@ -306,6 +337,8 @@ install_copilot() {
   done
   ok "Copilot: $count agents -> $dest_github"
   ok "Copilot: $count agents -> $dest_copilot"
+  warn "Copilot: Verify VS Code setting 'chat.agentFilesLocations' includes your install path."
+  dim  "         Open Settings (Ctrl/Cmd+,) -> search 'chat.agentFilesLocations'"
 }
 
 install_antigravity() {
@@ -346,16 +379,25 @@ install_gemini_cli() {
 }
 
 install_opencode() {
-  local src="$INTEGRATIONS/opencode/agents"
+  local src="$INTEGRATIONS/opencode"
   local dest="${PWD}/.opencode/agents"
   local count=0
   [[ -d "$src" ]] || { err "integrations/opencode missing. Run convert.sh first."; return 1; }
+  # Support both flat layout (integrations/opencode/*.md) and nested (integrations/opencode/agents/*.md)
+  local search_dir="$src"
+  [[ -d "$src/agents" ]] && search_dir="$src/agents"
   mkdir -p "$dest"
   local f
   while IFS= read -r -d '' f; do
+    local base; base="$(basename "$f")"
+    [[ "$base" == "README.md" ]] && continue
     cp "$f" "$dest/"; (( count++ )) || true
-  done < <(find "$src" -maxdepth 1 -name "*.md" -print0)
-  ok "OpenCode: $count agents -> $dest"
+  done < <(find "$search_dir" -maxdepth 1 -name "*.md" -print0)
+  if (( count == 0 )); then
+    warn "OpenCode: no agent files found in $search_dir. Run convert.sh --tool opencode first."
+  else
+    ok "OpenCode: $count agents -> $dest"
+  fi
   warn "OpenCode: project-scoped. Run from your project root to install there."
 }
 
@@ -363,21 +405,31 @@ install_openclaw() {
   local src="$INTEGRATIONS/openclaw"
   local dest="${HOME}/.openclaw/agency-agents"
   local count=0
+  local existing_agents=""
   [[ -d "$src" ]] || { err "integrations/openclaw missing. Run convert.sh first."; return 1; }
   mkdir -p "$dest"
+  if command -v openclaw >/dev/null 2>&1; then
+    existing_agents=$'\n'"$(openclaw agents list --json 2>/dev/null | sed -n 's/^[[:space:]]*\"id\": \"\\([^\"]*\\)\".*/\\1/p')"$'\n'
+  fi
   local d
   while IFS= read -r -d '' d; do
     local name; name="$(basename "$d")"
+    [[ -f "$d/SOUL.md" && -f "$d/AGENTS.md" && -f "$d/IDENTITY.md" ]] || continue
     mkdir -p "$dest/$name"
     cp "$d/SOUL.md" "$dest/$name/SOUL.md"
     cp "$d/AGENTS.md" "$dest/$name/AGENTS.md"
     cp "$d/IDENTITY.md" "$dest/$name/IDENTITY.md"
-    # Register with OpenClaw so agents are usable by agentId immediately
     if command -v openclaw >/dev/null 2>&1; then
-      openclaw agents add "$name" --workspace "$dest/$name" --non-interactive || true
+      if [[ "$existing_agents" != *$'\n'"$name"$'\n'* ]]; then
+        openclaw agents add "$name" --workspace "$dest/$name" --non-interactive || true
+      fi
     fi
     (( count++ )) || true
   done < <(find "$src" -mindepth 1 -maxdepth 1 -type d -print0)
+  if (( count == 0 )); then
+    err "integrations/openclaw contains no generated workspaces. Run ./scripts/convert.sh --tool openclaw first."
+    return 1
+  fi
   ok "OpenClaw: $count workspaces -> $dest"
   if command -v openclaw >/dev/null 2>&1; then
     warn "OpenClaw: run 'openclaw gateway restart' to activate new agents"
@@ -444,6 +496,28 @@ install_qwen() {
   warn "Tip: Run '/agents manage' in Qwen Code to refresh, or restart session"
 }
 
+install_kimi() {
+  local src="$INTEGRATIONS/kimi"
+  local dest="${HOME}/.config/kimi/agents"
+  local count=0
+
+  [[ -d "$src" ]] || { err "integrations/kimi missing. Run convert.sh first."; return 1; }
+
+  mkdir -p "$dest"
+
+  local d
+  while IFS= read -r -d '' d; do
+    local name; name="$(basename "$d")"
+    mkdir -p "$dest/$name"
+    cp "$d/agent.yaml" "$dest/$name/agent.yaml"
+    cp "$d/system.md" "$dest/$name/system.md"
+    (( count++ )) || true
+  done < <(find "$src" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  ok "Kimi Code: installed $count agents to $dest"
+  ok "Usage: kimi --agent-file ~/.config/kimi/agents/<agent-name>/agent.yaml"
+}
+
 install_tool() {
   case "$1" in
     claude-code) install_claude_code ;;
@@ -456,6 +530,7 @@ install_tool() {
     aider)       install_aider       ;;
     windsurf)    install_windsurf    ;;
     qwen)        install_qwen        ;;
+    kimi)        install_kimi        ;;
   esac
 }
 
@@ -465,12 +540,17 @@ install_tool() {
 main() {
   local tool="all"
   local interactive_mode="auto"
+  local use_parallel=false
+  local parallel_jobs
+  parallel_jobs="$(parallel_jobs_default)"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool)            tool="${2:?'--tool requires a value'}"; shift 2; interactive_mode="no" ;;
       --interactive)     interactive_mode="yes"; shift ;;
       --no-interactive)  interactive_mode="no"; shift ;;
+      --parallel)        use_parallel=true; shift ;;
+      --jobs)            parallel_jobs="${2:?'--jobs requires a value'}"; shift 2 ;;
       --help|-h)         usage ;;
       *)                 err "Unknown option: $1"; usage ;;
     esac
@@ -527,17 +607,48 @@ main() {
     exit 0
   fi
 
+  # When parent runs install.sh --parallel, it spawns workers with AGENCY_INSTALL_WORKER=1
+  # so each worker only runs install_tool(s) and skips header/done box (avoids duplicate output).
+  if [[ -n "${AGENCY_INSTALL_WORKER:-}" ]]; then
+    local t
+    for t in "${SELECTED_TOOLS[@]}"; do
+      install_tool "$t"
+    done
+    return 0
+  fi
+
   printf "\n"
   header "The Agency -- Installing agents"
   printf "  Repo:       %s\n" "$REPO_ROOT"
+  local n_selected=${#SELECTED_TOOLS[@]}
   printf "  Installing: %s\n" "${SELECTED_TOOLS[*]}"
+  if $use_parallel; then
+    ok "Installing $n_selected tools in parallel (output buffered per tool)."
+  fi
   printf "\n"
 
-  local installed=0 t
-  for t in "${SELECTED_TOOLS[@]}"; do
-    install_tool "$t"
-    (( installed++ )) || true
-  done
+  local installed=0 t i=0
+  if $use_parallel; then
+    local install_out_dir
+    install_out_dir="$(mktemp -d)"
+    export AGENCY_INSTALL_OUT_DIR="$install_out_dir"
+    export AGENCY_INSTALL_SCRIPT="$SCRIPT_DIR/install.sh"
+    printf '%s\n' "${SELECTED_TOOLS[@]}" | xargs -P "$parallel_jobs" -I {} sh -c 'AGENCY_INSTALL_WORKER=1 "$AGENCY_INSTALL_SCRIPT" --tool "{}" --no-interactive > "$AGENCY_INSTALL_OUT_DIR/{}" 2>&1'
+    for t in "${SELECTED_TOOLS[@]}"; do
+      [[ -f "$install_out_dir/$t" ]] && cat "$install_out_dir/$t"
+    done
+    rm -rf "$install_out_dir"
+    installed=$n_selected
+  else
+    for t in "${SELECTED_TOOLS[@]}"; do
+      (( i++ )) || true
+      progress_bar "$i" "$n_selected"
+      printf "\n"
+      printf "  ${C_DIM}[%s/%s]${C_RESET} %s\n" "$i" "$n_selected" "$t"
+      install_tool "$t"
+      (( installed++ )) || true
+    done
+  fi
 
   # Done box
   local msg="  Done!  Installed $installed tool(s)."
